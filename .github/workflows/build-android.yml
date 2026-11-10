@@ -1,0 +1,144 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+jobs:
+  android:
+    name: Android APK (debug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 对齐版本号
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          node -e "const fs=require('fs');for(const p of ['src-tauri/tauri.conf.json','package.json']){const j=JSON.parse(fs.readFileSync(p));j.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')}" "$V"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: 安装 Android SDK 组件与 NDK
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-android,i686-linux-android,x86_64-linux-android
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: android
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 初始化 Android 工程
+        run: pnpm tauri android init --ci
+
+      - name: 构建 Android APK (debug)
+        run: pnpm tauri android build --debug
+
+      - name: 整理构建产物
+        shell: bash
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          mkdir -p artifacts
+          found=0
+          for f in $(find src-tauri/gen/android/app/build/outputs/apk -name '*.apk' 2>/dev/null); do
+            echo "发现 APK: $f"
+            found=1
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::未找到 APK 构建产物"
+            exit 1
+          fi
+          # 通用包（全架构，任意安卓手机可装）改一个好认的名字
+          UNI=$(find src-tauri/gen/android/app/build/outputs/apk -name 'app-universal-debug.apk' 2>/dev/null | head -1)
+          if [ -n "$UNI" ]; then
+            cp "$UNI" "artifacts/HGhub_${V}_android-debug.apk"
+          fi
+          # 各架构分包也一并保留
+          for f in $(find src-tauri/gen/android/app/build/outputs/apk -name 'app-*-debug.apk' ! -name 'app-universal-debug.apk' 2>/dev/null); do
+            cp "$f" artifacts/
+          done
+          ls -lh artifacts/
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-Android-APK
+          path: artifacts/*
+          if-no-files-found: error
+
+  publish-release:
+    name: 发布 Android Release
+    needs: [android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载 APK 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: HGhub-Android-APK
+          path: artifacts
+
+      - name: 获取版本号
+        id: ver
+        run: |
+          V="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: 发布 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          TAG="v${V}-android"
+          APK="artifacts/HGhub_${V}_android-debug.apk"
+          NOTES="## HGhub Android 调试版 (v${V})
+
+          由 GitHub Actions 自动编译的 debug APK，未签名，下载后直接安装即可体验。
+          适用 Android 7.0+（minSdk 24），通用包包含全部四种架构（arm64-v8a / armeabi-v7a / x86 / x86_64）。
+
+          ### 安装说明
+          - 在安卓手机上下载 APK，允许“安装未知来源应用”后安装即可。
+          - 首次启动如提示网络权限，按系统提示放行。
+
+          本仓库为 [Minireel/HGhub](https://github.com/Minireel/HGhub) 的 fork，许可证 PolyForm Noncommercial 1.0.0（禁止商业用途）。"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK" --clobber
+            gh release edit "$TAG" --title "HGhub v${V} Android 版" --notes "$NOTES" --prerelease=false --latest
+          else
+            gh release create "$TAG" "$APK" --title "HGhub v${V} Android 版" --notes "$NOTES" --prerelease=false --latest
+          fi
