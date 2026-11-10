@@ -38,11 +38,11 @@ jobs:
           distribution: zulu
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-
-      - name: 安装 Android SDK 组件与 NDK
+      - name: 安装 Android SDK 组件与 NDK（使用 runner 自带 SDK）
         shell: bash
         run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/cmdline-tools" || true
           yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.0.12077973"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
